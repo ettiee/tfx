@@ -16,6 +16,7 @@
     in distributed training cluster.
 *   Added a Chicago Taxi example with native Keras.
 *   Updated TFLite converter to work with TF2.
+*   Changed Iris model_to_estimator e2e example to use generic Trainer.
 
 ## Bug fixes and other changes
 *   Added --skaffold_cmd flag when updating a pipeline for kubeflow in CLI.
