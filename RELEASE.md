@@ -22,6 +22,8 @@
 *   Added 'tfx_runner' label for CAIP, BQML and Dataflow jobs submitted from
     TFX components.
 *   Fixed the Taxi Colab notebook.
+*   Depends on `tensorflow-transform>=0.21.1,<0.22`.
+*   Depends on `tfx-bsl>=0.21.3,<0.22`.
 
 ### Deprecations
 
