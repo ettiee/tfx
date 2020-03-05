@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Text
 from google.protobuf import json_format
 from tfx import types
 from tfx.components.base import base_executor
+from tfx.components.infra_validator import error_types
 from tfx.components.infra_validator import request_builder
 from tfx.components.infra_validator import serving_bins
 from tfx.components.infra_validator import types as iv_types
@@ -34,9 +35,11 @@ from tfx.proto import infra_validator_pb2
 from tfx.types import artifact_utils
 from tfx.utils import io_utils
 from tfx.utils import path_utils
+from tfx.utils.model_paths import tf_serving_flavor
 
-_DEFAULT_NUM_TRIES = 3
+_DEFAULT_NUM_TRIES = 2
 _DEFAULT_POLLING_INTERVAL_SEC = 1
+_DEFAULT_MAX_LOADING_TIME_SEC = 300
 _DEFAULT_MODEL_NAME = 'infra-validation-model'
 
 # Filename of infra blessing artifact on succeed.
@@ -51,13 +54,13 @@ def _is_query_mode(input_dict: Dict[Text, List[types.Artifact]],
 
 
 def _create_model_server_runner(
-    model: types.Artifact,
+    model_path: Text,
     serving_binary: serving_bins.ServingBinary,
     serving_spec: infra_validator_pb2.ServingSpec):
   """Create a ModelServerRunner from a model, a ServingBinary and a ServingSpec.
 
   Args:
-    model: Model artifact that will be infra validated.
+    model_path: An IV-flavored model path. (See model_path_utils.py)
     serving_binary: One of ServingBinary instances parsed from the
         `serving_spec`.
     serving_spec: A ServingSpec instance of this infra validation.
@@ -68,7 +71,7 @@ def _create_model_server_runner(
   platform = serving_spec.WhichOneof('serving_platform')
   if platform == 'local_docker':
     return local_docker_runner.LocalDockerRunner(
-        model=model,
+        model_path=model_path,
         serving_binary=serving_binary,
         serving_spec=serving_spec
     )
@@ -120,7 +123,12 @@ class Executor(base_executor.BaseExecutor):
       serving_spec.model_name = _DEFAULT_MODEL_NAME
 
     validation_spec = infra_validator_pb2.ValidationSpec()
-    json_format.Parse(exec_properties['validation_spec'], validation_spec)
+    if exec_properties.get('validation_spec'):
+      json_format.Parse(exec_properties['validation_spec'], validation_spec)
+    if not validation_spec.num_tries:
+      validation_spec.num_tries = _DEFAULT_NUM_TRIES
+    if not validation_spec.max_loading_time_seconds:
+      validation_spec.max_loading_time_seconds = _DEFAULT_MAX_LOADING_TIME_SEC
 
     if _is_query_mode(input_dict, exec_properties):
       logging.info('InfraValidator will be run in LOAD_AND_QUERY mode.')
@@ -128,41 +136,76 @@ class Executor(base_executor.BaseExecutor):
       json_format.Parse(exec_properties['request_spec'], request_spec)
       examples = artifact_utils.get_single_instance(input_dict['examples'])
       requests = request_builder.build_requests(
-          model_name=os.path.basename(
-              os.path.dirname(path_utils.serving_model_path(model.uri))),
+          model_name=serving_spec.model_name,
           examples=examples,
           request_spec=request_spec)
     else:
       logging.info('InfraValidator will be run in LOAD_ONLY mode.')
       requests = []
 
-    # TODO(jjong): Make logic parallel.
-    all_passed = True
-    for serving_binary in serving_bins.parse_serving_binaries(serving_spec):
-      all_passed &= self._ValidateWithRetry(
-          model=model,
-          serving_binary=serving_binary,
-          serving_spec=serving_spec,
-          validation_spec=validation_spec,
-          requests=requests)
+    model_path = self._PrepareModelPath(model.uri, serving_spec)
+    try:
+      # TODO(jjong): Make logic parallel.
+      all_passed = True
+      for serving_binary in serving_bins.parse_serving_binaries(serving_spec):
+        all_passed &= self._ValidateWithRetry(
+            model_path=model_path,
+            serving_binary=serving_binary,
+            serving_spec=serving_spec,
+            validation_spec=validation_spec,
+            requests=requests)
+    finally:
+      self._Cleanup()
 
     if all_passed:
       _mark_blessed(blessing)
     else:
       _mark_not_blessed(blessing)
 
+  def _PrepareModelPath(
+      self, model_uri: Text,
+      serving_spec: infra_validator_pb2.ServingSpec) -> Text:
+    model_path = path_utils.serving_model_path(model_uri)
+    serving_binary = serving_spec.WhichOneof('serving_binary')
+    if serving_binary == 'tensorflow_serving':
+      # TensorFlow Serving requires model to be stored in its own directory
+      # structure flavor. If current model_path does not conform to the flavor,
+      # we need to make a copy to the temporary path.
+      try:
+        # Check whether current model_path conforms to the tensorflow serving
+        # model path flavor. (Parsed without exception)
+        tf_serving_flavor.parse_model_path(
+            model_path,
+            expected_model_name=serving_spec.model_name)
+      except ValueError:
+        # Copy the model to comply with the tensorflow serving model path
+        # flavor.
+        temp_model_path = tf_serving_flavor.make_model_path(
+            model_base_path=self._get_tmp_dir(),
+            model_name=serving_spec.model_name,
+            version=int(time.time()))
+        io_utils.copy_dir(src=path_utils.serving_model_path(model_uri),
+                          dst=temp_model_path)
+        return temp_model_path
+
+    return model_path
+
+  def _Cleanup(self):
+    io_utils.delete_dir(self._get_tmp_dir())
+
   def _ValidateWithRetry(
-      self, model: types.Artifact,
+      self, model_path: Text,
       serving_binary: serving_bins.ServingBinary,
       serving_spec: infra_validator_pb2.ServingSpec,
       validation_spec: infra_validator_pb2.ValidationSpec,
       requests: List[iv_types.Request]):
 
-    num_tries = validation_spec.num_tries or _DEFAULT_NUM_TRIES
-    for _ in range(num_tries):
+    for i in range(validation_spec.num_tries):
+      logging.info('Infra validation trial %d/%d start.', i + 1,
+                   validation_spec.num_tries)
       try:
         self._ValidateOnce(
-            model=model,
+            model_path=model_path,
             serving_binary=serving_binary,
             serving_spec=serving_spec,
             validation_spec=validation_spec,
@@ -171,14 +214,17 @@ class Executor(base_executor.BaseExecutor):
         return True
       except Exception as e:  # pylint: disable=broad-except
         # Exception indicates validation failure. Log the error and retry.
-        logging.error(e)
+        logging.exception(e)
+        if isinstance(e, error_types.DeadlineExceeded):
+          logging.info('Consider increasing the value of '
+                       'ValidationSpec.max_loading_time_seconds.')
         continue
 
     # Every trial has failed. Marking model as not blessed.
     return False
 
   def _ValidateOnce(
-      self, model: types.Artifact,
+      self, model_path: Text,
       serving_binary: serving_bins.ServingBinary,
       serving_spec: infra_validator_pb2.ServingSpec,
       validation_spec: infra_validator_pb2.ValidationSpec,
@@ -186,7 +232,7 @@ class Executor(base_executor.BaseExecutor):
 
     deadline = time.time() + validation_spec.max_loading_time_seconds
     runner = _create_model_server_runner(
-        model=model,
+        model_path=model_path,
         serving_binary=serving_binary,
         serving_spec=serving_spec)
 
